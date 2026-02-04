@@ -1,0 +1,7 @@
+
+# Ignore macOS junk
+.DS_Store
+
+# Ignore raw data
+/data/raw/
+*.txt
