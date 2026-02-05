@@ -2,3 +2,6 @@
 data/raw/
 *.txt
 .DS_Store
+data/
+.venv/
+.DS_Store
