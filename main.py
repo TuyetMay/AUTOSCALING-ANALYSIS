@@ -1,7 +1,10 @@
 """
-Main pipeline for preprocessing NASA log data
-Runs complete workflow from raw logs to time series features
-Optionally saves to PostgreSQL database
+Main pipeline for NASA log data analysis
+Complete workflow:
+1. Check if data already exists (skip preprocessing if found)
+2. Parse raw logs and build time series features (if needed)
+3. Train forecasting models (XGBoost + Seasonal Naive)
+4. Save to PostgreSQL (optional)
 """
 
 import sys
@@ -11,7 +14,10 @@ from datetime import datetime
 from configs.config import config as app_config
 from db_connector import PostgreSQLConnector
 from src.data.build_timeseries import build_all_timeseries
+from src.data.data_checker import check_csv_data, check_postgres_data, check_raw_data, check_trained_models, print_data_status
 from src.data.parse_log import parse_and_save
+from src.training.train_models import run_training_pipeline
+
 
 # Add current directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -30,6 +36,10 @@ def ensure_directories():
         "data/raw",
         "data/interim", 
         "data/processed",
+        "artifacts/models/1m",
+        "artifacts/models/5m",
+        "artifacts/models/15m",
+        "artifacts/predictions",
     ]
     for d in dirs:
         Path(d).mkdir(parents=True, exist_ok=True)
@@ -68,25 +78,39 @@ def save_to_postgres(db: PostgreSQLConnector, split: str):
     print(f"✓ Saved {split} data to PostgreSQL")
 
 
-def run_preprocessing_pipeline(save_to_db: bool = None):
+def run_preprocessing_pipeline(save_to_db: bool = None, force: bool = False):
     """
-    Complete preprocessing pipeline:
-    1. Parse raw log files (train.txt, test.txt) → CSV
-    2. Build time series features (1m, 5m, 15m) for each split
-    3. Optionally save to PostgreSQL database
+    Preprocessing pipeline: parse logs and build features
     
     Args:
         save_to_db: Override config setting for saving to PostgreSQL
+        force: Force reprocessing even if data exists
     """
-    start_time = datetime.now()
+    print_header("STEP 1: DATA PREPROCESSING")
     
-    print_header("NASA LOG PREPROCESSING PIPELINE")
-    print(f"Started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    # Check if data already exists
+    if not force:
+        has_csv, csv_info = check_csv_data()
+        has_pg, pg_info = check_postgres_data()
+        
+        if has_csv:
+            print("✓ Processed CSV data already exists:")
+            for filename, count in csv_info.items():
+                if count > 0:
+                    print(f"  - {filename}: {count:,} rows")
+            
+            if has_pg:
+                print("\n✓ PostgreSQL data already exists:")
+                for table, count in pg_info.items():
+                    if count > 0:
+                        print(f"  - {table}: {count:,} rows")
+            
+            print("\n⏭️  Skipping preprocessing (use --force to reprocess)")
+            return True
     
     # Determine if we should save to PostgreSQL
     if save_to_db is None:
         save_to_db = app_config.SAVE_TO_POSTGRES
-
     
     # Ensure directories exist
     ensure_directories()
@@ -103,57 +127,45 @@ def run_preprocessing_pipeline(save_to_db: bool = None):
             save_to_db = False
             db = None
     
-    # =============================
-    # STEP 1: Parse raw logs to CSV
-    # =============================
-    print_header("STEP 1: Parse Raw Logs → CSV")
+    # Check raw data
+    has_raw, raw_files = check_raw_data()
+    if not has_raw:
+        print("❌ ERROR: Raw data files not found!")
+        print("Please place the following files in data/raw/:")
+        for filename, exists in raw_files.items():
+            status = "✓" if exists else "✗"
+            print(f"  {status} {filename}")
+        return False
     
-    # Parse train.txt
+    # Parse raw logs to CSV
+    print_header("Parsing Raw Logs → CSV")
+    
     train_raw = "data/raw/train.txt"
     train_parsed = "data/interim/train_parsed.csv"
-    
-    if not Path(train_raw).exists():
-        print(f"❌ ERROR: {train_raw} not found!")
-        print("Please place train.txt in data/raw/ directory")
-        return
-    
     parse_and_save(train_raw, train_parsed)
     
-    # Parse test.txt
     test_raw = "data/raw/test.txt"
     test_parsed = "data/interim/test_parsed.csv"
-    
-    if not Path(test_raw).exists():
-        print(f"❌ ERROR: {test_raw} not found!")
-        print("Please place test.txt in data/raw/ directory")
-        return
-    
     parse_and_save(test_raw, test_parsed)
     
-    # ========================================
-    # STEP 2: Build time series features
-    # ========================================
-    print_header("STEP 2: Build Time Series Features")
+    # Build time series features
+    print_header("Building Time Series Features")
     
-    # Build train features (1m, 5m, 15m)
     build_all_timeseries(
         input_csv=train_parsed,
         output_dir="data/processed",
         split="train"
     )
     
-    # Build test features (1m, 5m, 15m)
     build_all_timeseries(
         input_csv=test_parsed,
         output_dir="data/processed",
         split="test"
     )
     
-    # ========================================
-    # STEP 3: Save to PostgreSQL (optional)
-    # ========================================
+    # Save to PostgreSQL (optional)
     if save_to_db and db:
-        print_header("STEP 3: Save to PostgreSQL")
+        print_header("Saving to PostgreSQL")
         
         try:
             save_to_postgres(db, "train")
@@ -167,60 +179,211 @@ def run_preprocessing_pipeline(save_to_db: bool = None):
         finally:
             db.close()
     
-    # =============================
-    # SUMMARY
-    # =============================
+    print_header("Preprocessing Complete")
+    print("✓ Data ready for training")
+    
+    return True
+
+
+def run_full_pipeline(
+    skip_preprocessing: bool = False,
+    skip_training: bool = False,
+    force_preprocessing: bool = False,
+    save_to_db: bool = None
+):
+    """
+    Run complete pipeline: preprocessing + training
+    
+    Args:
+        skip_preprocessing: Skip data preprocessing
+        skip_training: Skip model training
+        force_preprocessing: Force reprocessing even if data exists
+        save_to_db: Override config for PostgreSQL saving
+    """
+    start_time = datetime.now()
+    
+    print("\n" + "="*70)
+    print(" "*15 + "NASA LOG ANALYSIS PIPELINE")
+    print("="*70)
+    print(f"Started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    
+    # Show initial status
+    status = print_data_status()
+    
+    # Step 1: Preprocessing
+    if not skip_preprocessing:
+        success = run_preprocessing_pipeline(
+            save_to_db=save_to_db,
+            force=force_preprocessing
+        )
+        if not success:
+            print("\n❌ Pipeline failed at preprocessing stage")
+            return
+    else:
+        print_header("STEP 1: DATA PREPROCESSING")
+        print("⏭️  Skipping preprocessing (--skip-preprocessing)")
+        
+        # Check if data exists
+        has_csv, _ = check_csv_data()
+        if not has_csv:
+            print("\n❌ ERROR: No processed data found!")
+            print("Cannot skip preprocessing without existing data")
+            return
+    
+    # Step 2: Model Training
+    if not skip_training:
+        print_header("STEP 2: MODEL TRAINING")
+        
+        # Check if data exists
+        has_csv, _ = check_csv_data()
+        if not has_csv:
+            print("❌ ERROR: No processed data found!")
+            print("Run preprocessing first or remove --skip-preprocessing")
+            return
+        
+        try:
+            run_training_pipeline(
+                tags=["1m", "5m", "15m"],
+                targets=["hits", "total_bytes"],
+                models=["xgb", "seasonal_naive"]
+            )
+        except Exception as e:
+            print(f"\n❌ Training failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return
+    else:
+        print_header("STEP 2: MODEL TRAINING")
+        print("⏭️  Skipping training (--skip-training)")
+    
+    # Summary
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
     
-    print_header("PIPELINE COMPLETE")
+    print("\n" + "="*70)
+    print(" "*20 + "PIPELINE COMPLETE")
+    print("="*70)
     
-    print("✓ Generated files:")
-    print("\n  Parsed CSV:")
-    print(f"    - {train_parsed}")
-    print(f"    - {test_parsed}")
+    # Show final status
+    print("\n📊 Final Status:")
     
-    print("\n  Time Series Features:")
-    for split in ["train", "test"]:
-        for window in ["1m", "5m", "15m"]:
-            path = f"data/processed/{split}_ts_{window}.csv"
-            if Path(path).exists():
-                size = Path(path).stat().st_size / (1024 * 1024)  # MB
-                print(f"    - {path} ({size:.2f} MB)")
+    has_csv, csv_info = check_csv_data()
+    if has_csv:
+        print("  ✓ Processed data: 6 files ready")
     
-    if save_to_db:
-        print("\n  PostgreSQL Database:")
-        print(f"    - Database: {app_config.POSTGRES_DB}")
-        print(f"    - Schema: {app_config.POSTGRES_SCHEMA}")
-        print("    - Tables: parsed_logs, timeseries_1m, timeseries_5m, timeseries_15m")
+    has_models, model_info = check_trained_models()
+    if has_models:
+        total_models = sum(model_info.values())
+        print(f"  ✓ Trained models: {total_models} models ready")
     
-    print(f"\n✓ Total time: {duration:.1f} seconds")
+    metrics_file = Path("artifacts/metrics.csv")
+    if metrics_file.exists():
+        print(f"  ✓ Metrics: {metrics_file}")
+    
+    predictions_dir = Path("artifacts/predictions")
+    if predictions_dir.exists():
+        pred_files = list(predictions_dir.glob("*.csv"))
+        print(f"  ✓ Predictions: {len(pred_files)} files")
+    
+    print(f"\n⏱️  Total time: {duration:.1f} seconds")
     print(f"✓ Finished at: {end_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-    print("=" * 70)
-    print("\nNext steps:")
-    print("  - Train models using data/processed/*_ts_*.csv files")
-    if save_to_db:
-        print("  - Query PostgreSQL database for analysis and modeling")
-    print("  - Use 1m data for high-frequency predictions")
-    print("  - Use 5m data for medium-term forecasting")
-    print("  - Use 15m data for longer-term planning")
+    print("="*70)
+    
+    print("\n📝 Next steps:")
+    if has_models:
+        print("  - Review metrics in artifacts/metrics.csv")
+        print("  - Check predictions in artifacts/predictions/")
+        print("  - Use models for API deployment")
+    else:
+        print("  - Run training: python main.py --skip-preprocessing")
     print()
 
 
 if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="NASA Log Analysis Pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Run full pipeline (preprocessing + training)
+  python main.py
+  
+  # Skip preprocessing if data exists
+  python main.py --skip-preprocessing
+  
+  # Force reprocess data
+  python main.py --force
+  
+  # Only train models
+  python main.py --skip-preprocessing
+  
+  # Only preprocess data
+  python main.py --skip-training
+  
+  # Disable PostgreSQL
+  python main.py --no-db
+        """
+    )
+    
+    parser.add_argument(
+        "--skip-preprocessing",
+        action="store_true",
+        help="Skip data preprocessing (use existing processed data)"
+    )
+    
+    parser.add_argument(
+        "--skip-training",
+        action="store_true",
+        help="Skip model training (only preprocess data)"
+    )
+    
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force reprocessing even if data exists"
+    )
+    
+    parser.add_argument(
+        "--no-db",
+        action="store_true",
+        help="Disable PostgreSQL saving"
+    )
+    
+    parser.add_argument(
+        "--db",
+        action="store_true",
+        help="Enable PostgreSQL saving"
+    )
+    
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Show data status and exit"
+    )
+    
+    args = parser.parse_args()
+    
+    # Handle --status flag
+    if args.status:
+        print_data_status()
+        sys.exit(0)
+    
+    # Determine PostgreSQL setting
+    save_to_db = None
+    if args.no_db:
+        save_to_db = False
+    elif args.db:
+        save_to_db = True
+    
     try:
-        # Check for command line arguments
-        save_to_db = None
-        if len(sys.argv) > 1:
-            arg = sys.argv[1].lower()
-            if arg in ["--no-db", "--skip-db"]:
-                save_to_db = False
-                print("📝 PostgreSQL saving disabled via command line\n")
-            elif arg in ["--db", "--save-db"]:
-                save_to_db = True
-                print("📝 PostgreSQL saving enabled via command line\n")
-        
-        run_preprocessing_pipeline(save_to_db=save_to_db)
+        run_full_pipeline(
+            skip_preprocessing=args.skip_preprocessing,
+            skip_training=args.skip_training,
+            force_preprocessing=args.force,
+            save_to_db=save_to_db
+        )
         
     except KeyboardInterrupt:
         print("\n\n❌ Pipeline interrupted by user")
