@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 from src.evaluation.metrics import compute_metrics, MetricsLogger
+from sklearn.model_selection import TimeSeriesSplit
 
 
 class XGBTrainer:
