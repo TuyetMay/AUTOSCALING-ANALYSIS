@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
+import uvicorn
+
 from configs.config import config as app_config
 from db_connector import PostgreSQLConnector
 from src.data.build_timeseries import build_all_timeseries
@@ -209,19 +211,36 @@ def run_preprocessing_pipeline(save_to_db: bool = None):
 
 if __name__ == "__main__":
     try:
-        # Check for command line arguments
+        # Parse CLI flags
         save_to_db = None
-        if len(sys.argv) > 1:
-            arg = sys.argv[1].lower()
-            if arg in ["--no-db", "--skip-db"]:
-                save_to_db = False
-                print("📝 PostgreSQL saving disabled via command line\n")
-            elif arg in ["--db", "--save-db"]:
-                save_to_db = True
-                print("📝 PostgreSQL saving enabled via command line\n")
-        
-        run_preprocessing_pipeline(save_to_db=save_to_db)
-        
+        serve_api = False
+        skip_preprocessing = False
+
+        args = [a.lower() for a in sys.argv[1:]]
+
+        if "--serve-api" in args:
+            serve_api = True
+
+        if "--skip-preprocessing" in args:
+            skip_preprocessing = True
+
+        if "--no-db" in args or "--skip-db" in args:
+            save_to_db = False
+            print("📝 PostgreSQL saving disabled via command line\n")
+        elif "--db" in args or "--save-db" in args:
+            save_to_db = True
+            print("📝 PostgreSQL saving enabled via command line\n")
+
+        # Run preprocessing unless skipped
+        if not skip_preprocessing:
+            run_preprocessing_pipeline(save_to_db=save_to_db)
+        else:
+            print("📝 Preprocessing skipped via command line\n")
+
+        # Start API if requested
+        if serve_api:
+            uvicorn.run("src.api.main:app", host="127.0.0.1", port=8000, reload=True)
+
     except KeyboardInterrupt:
         print("\n\n❌ Pipeline interrupted by user")
         sys.exit(1)

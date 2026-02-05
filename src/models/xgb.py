@@ -1,209 +1,268 @@
-"""XGBoost forecaster utilities (hits + bytes).
-
-This module trains (if needed) and loads models for 1m/5m/15m forecasts.
-It expects the processed time-series CSVs created by src/data/build_timeseries.py:
-  data/processed/{split}_ts_{1m|5m|15m}.csv
-
-Targets:
-  - hits
-  - total_bytes
-"""
-
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Tuple, Optional, Dict
+from typing import Dict, Literal, Optional, Tuple
 
-import pandas as pd
+import joblib
 import numpy as np
-from joblib import dump, load
-
-try:
-    from xgboost import XGBRegressor
-except Exception as e:  # pragma: no cover
-    XGBRegressor = None  # type: ignore
-
+import pandas as pd
+from xgboost import XGBRegressor
 
 Granularity = Literal["1m", "5m", "15m"]
-Split = Literal["train", "test"]
+Mode = Literal["evaluate", "future"]
+Target = Literal["hits", "total_bytes"]
+
+ARTIFACT_DIR = Path("artifacts/models/xgb")
+DATA_DIR = Path("data/processed")
+
+# -----------------------------
+# Feature engineering (future-safe)
+# -----------------------------
+def _freq_from_granularity(g: Granularity) -> str:
+    return {"1m": "1T", "5m": "5T", "15m": "15T"}[g]
 
 
-@dataclass(frozen=True)
-class ModelPaths:
-    hits: Path
-    bytes: Path
-
-
-def _project_root() -> Path:
-    # .../src/models/xgb.py -> project root
-    return Path(__file__).resolve().parents[2]
-
-
-def _processed_ts_path(split: Split, granularity: Granularity) -> Path:
-    return _project_root() / "data" / "processed" / f"{split}_ts_{granularity}.csv"
-
-
-def _model_dir(granularity: Granularity) -> Path:
-    return _project_root() / "artifacts" / "models" / "xgb" / granularity
-
-
-def model_paths(granularity: Granularity) -> ModelPaths:
-    mdir = _model_dir(granularity)
-    return ModelPaths(
-        hits=mdir / "xgb_hits.joblib",
-        bytes=mdir / "xgb_bytes.joblib",
-    )
-
-
-def load_timeseries(split: Split, granularity: Granularity) -> pd.DataFrame:
-    path = _processed_ts_path(split, granularity)
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Missing processed time-series file: {path}. " 
-            "Run preprocessing first: python main.py (or python main.py --skip-db)"
-        )
-
-    df = pd.read_csv(path)
-    if "datetime" not in df.columns:
-        raise ValueError(f"Expected 'datetime' column in {path}")
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df = df.sort_values("datetime").reset_index(drop=True)
+def _make_time_features(dt_index: pd.DatetimeIndex) -> pd.DataFrame:
+    # safe time features
+    df = pd.DataFrame(index=dt_index)
+    df["hour"] = dt_index.hour
+    df["dow"] = dt_index.dayofweek
+    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24.0)
+    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24.0)
+    df["dow_sin"] = np.sin(2 * np.pi * df["dow"] / 7.0)
+    df["dow_cos"] = np.cos(2 * np.pi * df["dow"] / 7.0)
     return df
 
 
-def make_supervised(
+def _build_future_safe_features(
     df: pd.DataFrame,
-    horizon_steps: int = 1,
-    target_hits: str = "hits",
-    target_bytes: str = "total_bytes",
-) -> Tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
-    """Create supervised dataset using a forward shift.
-
-    Returns:
-      X, y_hits, y_bytes, dt_index
+    y_col: str,
+    lags: Tuple[int, ...] = (1, 2, 3, 6, 12),
+    rolls: Tuple[int, ...] = (3, 6, 12, 24),
+) -> pd.DataFrame:
     """
-    if horizon_steps < 1:
-        raise ValueError("horizon_steps must be >= 1")
+    Build features that can also be generated for future predictions.
+    Requires df indexed by datetime, with y_col present.
+    """
+    x = _make_time_features(df.index)
 
-    if target_hits not in df.columns or target_bytes not in df.columns:
-        raise ValueError("DataFrame must contain 'hits' and 'total_bytes'")
+    y = df[y_col].astype(float)
 
-    df2 = df.copy()
+    for k in lags:
+        x[f"{y_col}_lag_{k}"] = y.shift(k)
 
-    # targets = future values
-    df2["y_hits"] = df2[target_hits].shift(-horizon_steps)
-    df2["y_bytes"] = df2[target_bytes].shift(-horizon_steps)
+    for w in rolls:
+        x[f"{y_col}_roll_mean_{w}"] = y.rolling(w).mean()
+        x[f"{y_col}_roll_std_{w}"] = y.rolling(w).std()
 
-    # feature columns: everything except targets + datetime + future labels
-    drop_cols = {"datetime", "y_hits", "y_bytes"}
-    X = df2.drop(columns=[c for c in drop_cols if c in df2.columns])
+    # simple rate features
+    x[f"{y_col}_diff_1"] = y.diff(1)
+    x[f"{y_col}_pct_1"] = y.pct_change(1).replace([np.inf, -np.inf], np.nan)
 
-    # Also drop the original targets from features to avoid trivial leakage.
-    # (You can keep lags/rolling features that already encode history.)
-    for leak_col in [target_hits, target_bytes]:
-        if leak_col in X.columns:
-            X = X.drop(columns=[leak_col])
-
-    # remove rows where shifted target is NaN
-    mask = (~df2["y_hits"].isna()) & (~df2["y_bytes"].isna())
-    X = X.loc[mask].reset_index(drop=True)
-    y_hits = df2.loc[mask, "y_hits"].reset_index(drop=True)
-    y_bytes = df2.loc[mask, "y_bytes"].reset_index(drop=True)
-    dt = df2.loc[mask, "datetime"].reset_index(drop=True)
-
-    # Ensure numeric
-    X = X.apply(pd.to_numeric, errors="coerce").fillna(0.0)
-
-    return X, y_hits, y_bytes, dt
+    return x
 
 
-def _default_xgb_params(seed: int = 42) -> Dict:
-    return dict(
+def _load_ts(split: Literal["train", "test"], g: Granularity) -> pd.DataFrame:
+    path = DATA_DIR / f"{split}_ts_{g}.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing timeseries file: {path}")
+
+    df = pd.read_csv(path)
+    # try common datetime column names
+    dt_col = None
+    for c in ["datetime", "timestamp", "time", "ds"]:
+        if c in df.columns:
+            dt_col = c
+            break
+    if dt_col is None:
+        raise ValueError(f"Cannot find datetime column in {path}. Columns={list(df.columns)[:20]}")
+
+    df[dt_col] = pd.to_datetime(df[dt_col])
+    df = df.sort_values(dt_col).set_index(dt_col)
+    return df
+
+
+@dataclass
+class XGBBundle:
+    granularity: Granularity
+    models: Dict[Target, XGBRegressor]
+    feature_cols: Dict[Target, list]
+    y_cols: Dict[Target, str]
+
+
+def _default_model() -> XGBRegressor:
+    return XGBRegressor(
         n_estimators=600,
-        learning_rate=0.05,
         max_depth=6,
+        learning_rate=0.05,
         subsample=0.9,
         colsample_bytree=0.9,
         reg_lambda=1.0,
-        objective="reg:squarederror",
-        random_state=seed,
-        n_jobs=0,
+        random_state=42,
+        n_jobs=4,
     )
 
 
-def train_and_save(
+def train_xgb_bundle(
     granularity: Granularity,
-    horizon_steps: int = 1,
-    seed: int = 42,
     force: bool = False,
-) -> ModelPaths:
-    """Train XGBoost models on TRAIN split and save to artifacts."""
-    if XGBRegressor is None:
-        raise RuntimeError(
-            "xgboost is not installed. Install dependencies: pip install -r requirements.txt"
-        )
+) -> XGBBundle:
+    """
+    Train two models:
+      - hits
+      - total_bytes
+    using only future-safe features.
+    """
+    out_dir = ARTIFACT_DIR / granularity
+    out_dir.mkdir(parents=True, exist_ok=True)
+    bundle_path = out_dir / "bundle.joblib"
 
-    paths = model_paths(granularity)
-    paths.hits.parent.mkdir(parents=True, exist_ok=True)
+    if bundle_path.exists() and not force:
+        return joblib.load(bundle_path)
 
-    if (not force) and paths.hits.exists() and paths.bytes.exists():
-        return paths
+    df_train = _load_ts("train", granularity)
 
-    df_train = load_timeseries("train", granularity)
-    Xtr, y_hits, y_bytes, _ = make_supervised(df_train, horizon_steps=horizon_steps)
+    # Ensure target columns exist
+    y_map: Dict[Target, str] = {
+        "hits": "hits",
+        "total_bytes": "total_bytes",
+    }
+    for t, col in y_map.items():
+        if col not in df_train.columns:
+            raise ValueError(f"Missing column '{col}' in train_ts_{granularity}.csv")
 
-    params = _default_xgb_params(seed=seed)
+    models: Dict[Target, XGBRegressor] = {}
+    feature_cols: Dict[Target, list] = {}
 
-    m_hits = XGBRegressor(**params)
-    m_bytes = XGBRegressor(**params)
+    for target, y_col in y_map.items():
+        feats = _build_future_safe_features(df_train, y_col=y_col)
+        d = feats.copy()
+        d["y"] = df_train[y_col].astype(float)
 
-    m_hits.fit(Xtr, y_hits)
-    m_bytes.fit(Xtr, y_bytes)
+        d = d.dropna()
+        X = d.drop(columns=["y"])
+        y = d["y"]
 
-    dump(m_hits, paths.hits)
-    dump(m_bytes, paths.bytes)
+        m = _default_model()
+        m.fit(X, y)
 
-    return paths
+        models[target] = m
+        feature_cols[target] = list(X.columns)
+
+    bundle = XGBBundle(
+        granularity=granularity,
+        models=models,
+        feature_cols=feature_cols,
+        y_cols=y_map,
+    )
+    joblib.dump(bundle, bundle_path)
+    return bundle
 
 
-def load_or_train(
+def evaluate_on_split(
     granularity: Granularity,
-    horizon_steps: int = 1,
-    force_train: bool = False,
-):
-    paths = model_paths(granularity)
-    if force_train or (not paths.hits.exists()) or (not paths.bytes.exists()):
-        train_and_save(granularity, horizon_steps=horizon_steps, force=True)
-
-    m_hits = load(paths.hits)
-    m_bytes = load(paths.bytes)
-    return m_hits, m_bytes
-
-
-def predict_on_split(
-    granularity: Granularity,
-    split: Split = "test",
-    horizon_steps: int = 1,
+    split: Literal["train", "test"],
+    last_n: Optional[int] = None,
     force_train: bool = False,
 ) -> pd.DataFrame:
-    """Predict for the chosen split (default: test) and return a tidy DataFrame."""
-    m_hits, m_bytes = load_or_train(granularity, horizon_steps=horizon_steps, force_train=force_train)
-    df = load_timeseries(split, granularity)
-    X, y_hits, y_bytes, dt = make_supervised(df, horizon_steps=horizon_steps)
+    """
+    Backtest on existing split; returns dataframe with y_true/y_pred for both targets.
+    """
+    bundle = train_xgb_bundle(granularity, force=force_train)
+    df = _load_ts(split, granularity)
 
-    pred_hits = np.maximum(0.0, m_hits.predict(X))
-    pred_bytes = np.maximum(0.0, m_bytes.predict(X))
+    rows = []
+    for target, y_col in bundle.y_cols.items():
+        feats = _build_future_safe_features(df, y_col=y_col)
+        d = feats.copy()
+        d["y_true"] = df[y_col].astype(float)
+        d = d.dropna()
+
+        X = d[bundle.feature_cols[target]]
+        pred = bundle.models[target].predict(X)
+
+        out = pd.DataFrame(index=d.index)
+        out[f"{target}_true"] = d["y_true"].values
+        out[f"{target}_pred"] = pred
+        rows.append(out)
+
+    out_all = pd.concat(rows, axis=1)
+    out_all = out_all.sort_index()
+
+    if last_n is not None:
+        out_all = out_all.tail(int(last_n))
+
+    out_all = out_all.reset_index().rename(columns={out_all.index.name: "datetime"})
+    return out_all
+
+
+def forecast_future_recursive(
+    granularity: Granularity,
+    horizon_steps: int,
+    last_n_context: int = 500,
+    force_train: bool = False,
+) -> pd.DataFrame:
+    """
+    True future forecast for BOTH hits and bytes using recursive strategy.
+
+    - Uses TRAIN split as history context.
+    - Generates next timestamps based on granularity.
+    - For each step: build future-safe features from (history + predicted),
+      then predict next value.
+    """
+    bundle = train_xgb_bundle(granularity, force=force_train)
+    df_hist = _load_ts("train", granularity)
+
+    freq = _freq_from_granularity(granularity)
+
+    # context: keep last N for stable rolling/lag
+    df_hist = df_hist.tail(max(int(last_n_context), 200))
+
+    # work copies for recursive updates
+    hist_hits = df_hist[bundle.y_cols["hits"]].astype(float).copy()
+    hist_bytes = df_hist[bundle.y_cols["total_bytes"]].astype(float).copy()
+
+    start_ts = df_hist.index.max()
+    future_index = pd.date_range(start=start_ts + pd.tseries.frequencies.to_offset(freq),
+                                 periods=int(horizon_steps), freq=freq)
+
+    preds_hits = []
+    preds_bytes = []
+
+    # Build a temp DF that we append to
+    df_tmp = df_hist[[bundle.y_cols["hits"], bundle.y_cols["total_bytes"]]].copy()
+
+    for ts in future_index:
+        # append placeholder row
+        df_tmp.loc[ts, bundle.y_cols["hits"]] = np.nan
+        df_tmp.loc[ts, bundle.y_cols["total_bytes"]] = np.nan
+
+        # predict hits
+        feats_hits = _build_future_safe_features(df_tmp, y_col=bundle.y_cols["hits"])
+        xh = feats_hits.loc[[ts]].copy()
+        xh = xh[bundle.feature_cols["hits"]]
+        ph = float(bundle.models["hits"].predict(xh)[0])
+
+        # set predicted hits in df_tmp (so future steps can use lags/rolls)
+        df_tmp.loc[ts, bundle.y_cols["hits"]] = ph
+        preds_hits.append(ph)
+
+        # predict bytes
+        feats_b = _build_future_safe_features(df_tmp, y_col=bundle.y_cols["total_bytes"])
+        xb = feats_b.loc[[ts]].copy()
+        xb = xb[bundle.feature_cols["total_bytes"]]
+        pb = float(bundle.models["total_bytes"].predict(xb)[0])
+
+        df_tmp.loc[ts, bundle.y_cols["total_bytes"]] = pb
+        preds_bytes.append(pb)
 
     out = pd.DataFrame(
         {
-            "datetime": dt,
-            "granularity": granularity,
-            "horizon_steps": horizon_steps,
-            "y_hits_true": y_hits.astype(float),
-            "y_hits_pred": pred_hits.astype(float),
-            "y_bytes_true": y_bytes.astype(float),
-            "y_bytes_pred": pred_bytes.astype(float),
+            "datetime": future_index,
+            "hits_pred": preds_hits,
+            "total_bytes_pred": preds_bytes,
         }
     )
     return out

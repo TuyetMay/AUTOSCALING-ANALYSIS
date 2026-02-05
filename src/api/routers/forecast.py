@@ -3,7 +3,6 @@ from __future__ import annotations
 import io
 import zipfile
 from datetime import datetime
-from typing import Tuple
 
 import matplotlib
 matplotlib.use("Agg")  # server-safe backend
@@ -13,37 +12,39 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from src.api.schemas import ForecastRequest
-from src.models.xgb import predict_on_split
-
+from src.models.xgb import evaluate_on_split, forecast_future_recursive
 
 router = APIRouter(prefix="/forecast", tags=["forecast"])
 
 
 def _make_plot(df_pred: pd.DataFrame, title: str) -> bytes:
-    """Return a PNG bytes for hits and bytes true vs pred."""
+    """Return PNG bytes with 2 panels: hits + bytes."""
     if df_pred.empty:
-        raise ValueError("No prediction rows to plot")
+        raise ValueError("No rows to plot")
 
-    # Ensure datetime
     x = pd.to_datetime(df_pred["datetime"])
 
     fig = plt.figure(figsize=(14, 7))
     ax1 = fig.add_subplot(2, 1, 1)
-    ax1.plot(x, df_pred["y_hits_true"], label="hits_true")
-    ax1.plot(x, df_pred["y_hits_pred"], label="hits_pred")
+
+    # Hits
+    if "hits_true" in df_pred.columns:
+        ax1.plot(x, df_pred["hits_true"], label="hits_true")
+    ax1.plot(x, df_pred["hits_pred"], label="hits_pred")
     ax1.set_title(f"{title} — Hits")
     ax1.legend(loc="upper right")
     ax1.grid(True, alpha=0.3)
 
+    # Bytes
     ax2 = fig.add_subplot(2, 1, 2)
-    ax2.plot(x, df_pred["y_bytes_true"], label="bytes_true")
-    ax2.plot(x, df_pred["y_bytes_pred"], label="bytes_pred")
-    ax2.set_title(f"{title} — Bytes")
+    if "total_bytes_true" in df_pred.columns:
+        ax2.plot(x, df_pred["total_bytes_true"], label="bytes_true")
+    ax2.plot(x, df_pred["total_bytes_pred"], label="bytes_pred")
+    ax2.set_title(f"{title} — Total Bytes")
     ax2.legend(loc="upper right")
     ax2.grid(True, alpha=0.3)
 
     fig.tight_layout()
-
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=150)
     plt.close(fig)
@@ -55,33 +56,36 @@ def _make_plot(df_pred: pd.DataFrame, title: str) -> bytes:
     "",
     summary="Forecast hits + bytes with XGBoost",
     description=(
-        "Returns a ZIP that contains predictions.csv and forecast.png. "
-        "If model artifacts are missing, the API will train on train split automatically."
+        "Returns a ZIP containing predictions.csv and forecast.png. "
+        "mode=evaluate uses train/test backtest; mode=future does recursive future forecast."
     ),
 )
 def forecast(req: ForecastRequest):
     try:
-        df_pred = predict_on_split(
-            granularity=req.granularity,
-            split=req.split,
-            horizon_steps=req.horizon_steps,
-            force_train=req.force_train,
-        )
+        if getattr(req, "mode", "evaluate") == "future":
+            df_pred = forecast_future_recursive(
+                granularity=req.granularity,
+                horizon_steps=req.horizon_steps,
+                last_n_context=req.last_n or 500,
+                force_train=req.force_train,
+            )
+        else:
+            df_pred = evaluate_on_split(
+                granularity=req.granularity,
+                split=req.split,
+                last_n=req.last_n,
+                force_train=req.force_train,
+            )
     except FileNotFoundError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Forecast failed: {e}")
 
-    if req.last_n is not None and len(df_pred) > req.last_n:
-        df_pred = df_pred.tail(req.last_n).reset_index(drop=True)
+    # Make CSV bytes
+    csv_bytes = df_pred.to_csv(index=False).encode("utf-8")
 
-    # CSV bytes
-    csv_buf = io.StringIO()
-    df_pred.to_csv(csv_buf, index=False)
-    csv_bytes = csv_buf.getvalue().encode("utf-8")
-
-    # PNG bytes
-    title = f"XGBoost Forecast ({req.granularity}, {req.split}, horizon={req.horizon_steps})"
+    # Make PNG bytes
+    title = f"XGBoost Forecast ({req.granularity}, mode={getattr(req,'mode','evaluate')}, horizon={req.horizon_steps})"
     try:
         png_bytes = _make_plot(df_pred, title=title)
     except Exception as e:
@@ -95,7 +99,7 @@ def forecast(req: ForecastRequest):
     zip_buf.seek(0)
 
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    fname = f"forecast_{req.granularity}_{req.split}_h{req.horizon_steps}_{ts}.zip"
-
+    fname = f"forecast_{req.granularity}_{ts}.zip"
     headers = {"Content-Disposition": f'attachment; filename="{fname}"'}
+
     return StreamingResponse(zip_buf, media_type="application/zip", headers=headers)

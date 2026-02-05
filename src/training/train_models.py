@@ -1,263 +1,268 @@
-"""
-Training pipeline for forecasting models
-Trains XGBoost and Seasonal Naive models on all time windows
-"""
+from __future__ import annotations
 
-import sys
+import math
+from dataclasses import dataclass
 from pathlib import Path
-from datetime import datetime
-import pandas as pd
+from typing import Dict, Literal, Optional, Tuple
+
+import joblib
 import numpy as np
+import pandas as pd
+from xgboost import XGBRegressor
 
-from src.models.seasonal_native import SeasonalNaiveTrainer
+Granularity = Literal["1m", "5m", "15m"]
+Mode = Literal["evaluate", "future"]
+Target = Literal["hits", "total_bytes"]
 
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+ARTIFACT_DIR = Path("artifacts/models/xgb")
+DATA_DIR = Path("data/processed")
 
-from src.evaluation.metrics import MetricsLogger
-from src.models.xgb import XGBTrainer
+# -----------------------------
+# Feature engineering (future-safe)
+# -----------------------------
+def _freq_from_granularity(g: Granularity) -> str:
+    return {"1m": "1T", "5m": "5T", "15m": "15T"}[g]
 
 
-def prepare_training_data(tag: str) -> tuple:
+def _make_time_features(dt_index: pd.DatetimeIndex) -> pd.DataFrame:
+    # safe time features
+    df = pd.DataFrame(index=dt_index)
+    df["hour"] = dt_index.hour
+    df["dow"] = dt_index.dayofweek
+    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24.0)
+    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24.0)
+    df["dow_sin"] = np.sin(2 * np.pi * df["dow"] / 7.0)
+    df["dow_cos"] = np.cos(2 * np.pi * df["dow"] / 7.0)
+    return df
+
+
+def _build_future_safe_features(
+    df: pd.DataFrame,
+    y_col: str,
+    lags: Tuple[int, ...] = (1, 2, 3, 6, 12),
+    rolls: Tuple[int, ...] = (3, 6, 12, 24),
+) -> pd.DataFrame:
     """
-    Load and prepare training/test data for a given time window
-    
-    Args:
-        tag: Time window (1m, 5m, 15m)
-        
-    Returns:
-        (train_df, test_df, feature_cols_hits, feature_cols_bytes)
+    Build features that can also be generated for future predictions.
+    Requires df indexed by datetime, with y_col present.
     """
-    # Load data
-    train_path = f"data/processed/train_ts_{tag}.csv"
-    test_path = f"data/processed/test_ts_{tag}.csv"
-    
-    print(f"\nLoading data for {tag}:")
-    print(f"  Train: {train_path}")
-    print(f"  Test: {test_path}")
-    
-    train_df = pd.read_csv(train_path)
-    test_df = pd.read_csv(test_path)
-    
-    # Convert datetime
-    train_df["datetime"] = pd.to_datetime(train_df["datetime"])
-    test_df["datetime"] = pd.to_datetime(test_df["datetime"])
-    
-    print(f"  Train: {len(train_df):,} rows | {train_df['datetime'].min()} → {train_df['datetime'].max()}")
-    print(f"  Test: {len(test_df):,} rows | {test_df['datetime'].min()} → {test_df['datetime'].max()}")
-    
-    # Define feature columns
-    # Exclude datetime, targets, and other non-feature columns
-    exclude_cols = {
-        'datetime', 'hits', 'total_bytes', 'split',
-        'hits_lag_1', 'hits_lag_2', 'hits_lag_3', 'hits_lag_4', 
-        'hits_lag_5', 'hits_lag_6', 'hits_lag_10',
-        'bytes_lag_1', 'bytes_lag_2', 'bytes_lag_3', 'bytes_lag_4',
-        'bytes_lag_5', 'bytes_lag_6', 'bytes_lag_10'
+    x = _make_time_features(df.index)
+
+    y = df[y_col].astype(float)
+
+    for k in lags:
+        x[f"{y_col}_lag_{k}"] = y.shift(k)
+
+    for w in rolls:
+        x[f"{y_col}_roll_mean_{w}"] = y.rolling(w).mean()
+        x[f"{y_col}_roll_std_{w}"] = y.rolling(w).std()
+
+    # simple rate features
+    x[f"{y_col}_diff_1"] = y.diff(1)
+    x[f"{y_col}_pct_1"] = y.pct_change(1).replace([np.inf, -np.inf], np.nan)
+
+    return x
+
+
+def _load_ts(split: Literal["train", "test"], g: Granularity) -> pd.DataFrame:
+    path = DATA_DIR / f"{split}_ts_{g}.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"Missing timeseries file: {path}")
+
+    df = pd.read_csv(path)
+    # try common datetime column names
+    dt_col = None
+    for c in ["datetime", "timestamp", "time", "ds"]:
+        if c in df.columns:
+            dt_col = c
+            break
+    if dt_col is None:
+        raise ValueError(f"Cannot find datetime column in {path}. Columns={list(df.columns)[:20]}")
+
+    df[dt_col] = pd.to_datetime(df[dt_col])
+    df = df.sort_values(dt_col).set_index(dt_col)
+    return df
+
+
+@dataclass
+class XGBBundle:
+    granularity: Granularity
+    models: Dict[Target, XGBRegressor]
+    feature_cols: Dict[Target, list]
+    y_cols: Dict[Target, str]
+
+
+def _default_model() -> XGBRegressor:
+    return XGBRegressor(
+        n_estimators=600,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        reg_lambda=1.0,
+        random_state=42,
+        n_jobs=4,
+    )
+
+
+def train_xgb_bundle(
+    granularity: Granularity,
+    force: bool = False,
+) -> XGBBundle:
+    """
+    Train two models:
+      - hits
+      - total_bytes
+    using only future-safe features.
+    """
+    out_dir = ARTIFACT_DIR / granularity
+    out_dir.mkdir(parents=True, exist_ok=True)
+    bundle_path = out_dir / "bundle.joblib"
+
+    if bundle_path.exists() and not force:
+        return joblib.load(bundle_path)
+
+    df_train = _load_ts("train", granularity)
+
+    # Ensure target columns exist
+    y_map: Dict[Target, str] = {
+        "hits": "hits",
+        "total_bytes": "total_bytes",
     }
-    
-    # All columns except excluded ones
-    all_cols = set(train_df.columns)
-    base_features = list(all_cols - exclude_cols)
-    
-    # Features for hits prediction (include bytes features)
-    feature_cols_hits = base_features.copy()
-    
-    # Features for bytes prediction (exclude hits-related features to avoid leakage)
-    hits_related = {col for col in base_features if 'hits' in col.lower()}
-    feature_cols_bytes = [col for col in base_features if col not in hits_related]
-    
-    print(f"  Features for hits: {len(feature_cols_hits)}")
-    print(f"  Features for bytes: {len(feature_cols_bytes)}")
-    
-    return train_df, test_df, feature_cols_hits, feature_cols_bytes
+    for t, col in y_map.items():
+        if col not in df_train.columns:
+            raise ValueError(f"Missing column '{col}' in train_ts_{granularity}.csv")
+
+    models: Dict[Target, XGBRegressor] = {}
+    feature_cols: Dict[Target, list] = {}
+
+    for target, y_col in y_map.items():
+        feats = _build_future_safe_features(df_train, y_col=y_col)
+        d = feats.copy()
+        d["y"] = df_train[y_col].astype(float)
+
+        d = d.dropna()
+        X = d.drop(columns=["y"])
+        y = d["y"]
+
+        m = _default_model()
+        m.fit(X, y)
+
+        models[target] = m
+        feature_cols[target] = list(X.columns)
+
+    bundle = XGBBundle(
+        granularity=granularity,
+        models=models,
+        feature_cols=feature_cols,
+        y_cols=y_map,
+    )
+    joblib.dump(bundle, bundle_path)
+    return bundle
 
 
-def run_training_pipeline(
-    tags: list = None,
-    targets: list = None,
-    models: list = None
-):
+def evaluate_on_split(
+    granularity: Granularity,
+    split: Literal["train", "test"],
+    last_n: Optional[int] = None,
+    force_train: bool = False,
+) -> pd.DataFrame:
     """
-    Run complete training pipeline
-    
-    Args:
-        tags: Time windows to train (default: ['1m', '5m', '15m'])
-        targets: Targets to predict (default: ['hits', 'total_bytes'])
-        models: Models to train (default: ['xgb', 'seasonal_naive'])
+    Backtest on existing split; returns dataframe with y_true/y_pred for both targets.
     """
-    start_time = datetime.now()
-    
-    print("\n" + "="*70)
-    print("MODEL TRAINING PIPELINE")
-    print("="*70)
-    print(f"Started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-    
-    # Defaults
-    if tags is None:
-        tags = ["1m", "5m", "15m"]
-    if targets is None:
-        targets = ["hits", "total_bytes"]
-    if models is None:
-        models = ["xgb", "seasonal_naive"]
-    
-    print(f"Configuration:")
-    print(f"  Time windows: {tags}")
-    print(f"  Targets: {targets}")
-    print(f"  Models: {models}")
-    
-    # Setup directories
-    artifacts_dir = Path("artifacts")
-    models_dir = artifacts_dir / "models"
-    predictions_dir = artifacts_dir / "predictions"
-    metrics_path = artifacts_dir / "metrics.csv"
-    
-    for d in [artifacts_dir, models_dir, predictions_dir]:
-        d.mkdir(parents=True, exist_ok=True)
-    
-    # Initialize metrics logger
-    metrics_logger = MetricsLogger(str(metrics_path))
-    
-    # XGBoost parameters
-    xgb_params = {
-        "booster": "gbtree",
-        "n_estimators": 5000,
-        "early_stopping_rounds": 50,
-        "objective": "reg:squarederror",
-        "max_depth": 6,
-        "learning_rate": 0.05,
-        "subsample": 0.9,
-        "colsample_bytree": 0.9,
-        "reg_lambda": 1.0,
-        "random_state": 42,
-    }
-    
-    # Initialize trainers
-    xgb_trainer = XGBTrainer(
-        model_dir=str(models_dir),
-        predictions_dir=str(predictions_dir),
-        metrics_logger=metrics_logger,
-        xgb_params=xgb_params,
-        cv_splits=5,
-        cv_test_days=2,
-        cv_gap_steps=1
-    )
-    
-    seasonal_trainer = SeasonalNaiveTrainer(
-        predictions_dir=str(predictions_dir),
-        metrics_logger=metrics_logger
-    )
-    
-    # Train models for each combination
-    print("\n" + "="*70)
-    print("TRAINING MODELS")
-    print("="*70)
-    
-    for tag in tags:
-        print(f"\n{'#'*70}")
-        print(f"# Time Window: {tag}")
-        print(f"{'#'*70}")
-        
-        # Load data
-        try:
-            train_df, test_df, feat_hits, feat_bytes = prepare_training_data(tag)
-        except FileNotFoundError as e:
-            print(f"⚠️  Skipping {tag}: {e}")
-            continue
-        
-        for target in targets:
-            # Determine feature columns and log transform
-            if target == "hits":
-                feature_cols = feat_hits
-                use_log = False
-            else:  # total_bytes
-                feature_cols = feat_bytes
-                use_log = True
-            
-            # Train XGBoost
-            if "xgb" in models:
-                try:
-                    xgb_trainer.train_one_model(
-                        train_df=train_df,
-                        test_df=test_df,
-                        feature_cols=feature_cols,
-                        target=target,
-                        tag=tag,
-                        use_log=use_log
-                    )
-                except Exception as e:
-                    print(f"❌ XGBoost training failed for {target} @ {tag}: {e}")
-            
-            # Train Seasonal Naive
-            if "seasonal_naive" in models:
-                try:
-                    seasonal_trainer.train_one_model(
-                        train_df=train_df,
-                        test_df=test_df,
-                        target=target,
-                        tag=tag
-                    )
-                except Exception as e:
-                    print(f"❌ Seasonal Naive training failed for {target} @ {tag}: {e}")
-    
-    # Summary
-    end_time = datetime.now()
-    duration = (end_time - start_time).total_seconds()
-    
-    print("\n" + "="*70)
-    print("TRAINING COMPLETE")
-    print("="*70)
-    
-    # Print metrics summary
-    metrics_logger.print_summary()
-    
-    print(f"\n✓ Models saved to: {models_dir}")
-    print(f"✓ Predictions saved to: {predictions_dir}")
-    print(f"✓ Metrics saved to: {metrics_path}")
-    print(f"\n✓ Total time: {duration:.1f} seconds")
-    print(f"✓ Finished at: {end_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-    print("="*70)
+    bundle = train_xgb_bundle(granularity, force=force_train)
+    df = _load_ts(split, granularity)
+
+    rows = []
+    for target, y_col in bundle.y_cols.items():
+        feats = _build_future_safe_features(df, y_col=y_col)
+        d = feats.copy()
+        d["y_true"] = df[y_col].astype(float)
+        d = d.dropna()
+
+        X = d[bundle.feature_cols[target]]
+        pred = bundle.models[target].predict(X)
+
+        out = pd.DataFrame(index=d.index)
+        out[f"{target}_true"] = d["y_true"].values
+        out[f"{target}_pred"] = pred
+        rows.append(out)
+
+    out_all = pd.concat(rows, axis=1)
+    out_all = out_all.sort_index()
+
+    if last_n is not None:
+        out_all = out_all.tail(int(last_n))
+
+    out_all = out_all.reset_index().rename(columns={out_all.index.name: "datetime"})
+    return out_all
 
 
-if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Train forecasting models")
-    parser.add_argument(
-        "--tags",
-        nargs="+",
-        default=["1m", "5m", "15m"],
-        help="Time windows to train (default: 1m 5m 15m)"
-    )
-    parser.add_argument(
-        "--targets",
-        nargs="+",
-        default=["hits", "total_bytes"],
-        help="Targets to predict (default: hits total_bytes)"
-    )
-    parser.add_argument(
-        "--models",
-        nargs="+",
-        default=["xgb", "seasonal_naive"],
-        help="Models to train (default: xgb seasonal_naive)"
-    )
-    
-    args = parser.parse_args()
-    
-    try:
-        run_training_pipeline(
-            tags=args.tags,
-            targets=args.targets,
-            models=args.models
-        )
-    except KeyboardInterrupt:
-        print("\n\n❌ Training interrupted by user")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n\n❌ Training failed with error:")
-        print(f"   {type(e).__name__}: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+def forecast_future_recursive(
+    granularity: Granularity,
+    horizon_steps: int,
+    last_n_context: int = 500,
+    force_train: bool = False,
+) -> pd.DataFrame:
+    """
+    True future forecast for BOTH hits and bytes using recursive strategy.
 
+    - Uses TRAIN split as history context.
+    - Generates next timestamps based on granularity.
+    - For each step: build future-safe features from (history + predicted),
+      then predict next value.
+    """
+    bundle = train_xgb_bundle(granularity, force=force_train)
+    df_hist = _load_ts("train", granularity)
 
+    freq = _freq_from_granularity(granularity)
+
+    # context: keep last N for stable rolling/lag
+    df_hist = df_hist.tail(max(int(last_n_context), 200))
+
+    # work copies for recursive updates
+    hist_hits = df_hist[bundle.y_cols["hits"]].astype(float).copy()
+    hist_bytes = df_hist[bundle.y_cols["total_bytes"]].astype(float).copy()
+
+    start_ts = df_hist.index.max()
+    future_index = pd.date_range(start=start_ts + pd.tseries.frequencies.to_offset(freq),
+                                 periods=int(horizon_steps), freq=freq)
+
+    preds_hits = []
+    preds_bytes = []
+
+    # Build a temp DF that we append to
+    df_tmp = df_hist[[bundle.y_cols["hits"], bundle.y_cols["total_bytes"]]].copy()
+
+    for ts in future_index:
+        # append placeholder row
+        df_tmp.loc[ts, bundle.y_cols["hits"]] = np.nan
+        df_tmp.loc[ts, bundle.y_cols["total_bytes"]] = np.nan
+
+        # predict hits
+        feats_hits = _build_future_safe_features(df_tmp, y_col=bundle.y_cols["hits"])
+        xh = feats_hits.loc[[ts]].copy()
+        xh = xh[bundle.feature_cols["hits"]]
+        ph = float(bundle.models["hits"].predict(xh)[0])
+
+        # set predicted hits in df_tmp (so future steps can use lags/rolls)
+        df_tmp.loc[ts, bundle.y_cols["hits"]] = ph
+        preds_hits.append(ph)
+
+        # predict bytes
+        feats_b = _build_future_safe_features(df_tmp, y_col=bundle.y_cols["total_bytes"])
+        xb = feats_b.loc[[ts]].copy()
+        xb = xb[bundle.feature_cols["total_bytes"]]
+        pb = float(bundle.models["total_bytes"].predict(xb)[0])
+
+        df_tmp.loc[ts, bundle.y_cols["total_bytes"]] = pb
+        preds_bytes.append(pb)
+
+    out = pd.DataFrame(
+        {
+            "datetime": future_index,
+            "hits_pred": preds_hits,
+            "total_bytes_pred": preds_bytes,
+        }
+    )
+    return out
