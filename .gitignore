@@ -1,7 +1,13 @@
-.venv/
+# Data folders
 data/raw/
+data/interim/
+data/processed/
+*.csv
 *.txt
+
+# OS / env
 .DS_Store
-data/
 .venv/
-.DS_Store
+__pycache__/
+*.pyc
+.env
